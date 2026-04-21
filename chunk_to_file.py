@@ -2,13 +2,9 @@ import json
 import hashlib
 from pathlib import Path
 import re
-import uuid
 import os
 
 from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,28 +13,11 @@ MODEL_NAME = "AITeamVN/Vietnamese_Embedding_v2"
 MAX_TOKENS = 768
 MAX_TOKENS_AMEND = 1024
 
-model = SentenceTransformer(MODEL_NAME)
+model = SentenceTransformer(MODEL_NAME, device='cpu')
 model.max_seq_length = 1024
 tokenizer = model.tokenizer
 def count_tokens(text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
-
-COLLECTION_NAME = "luat_giao_thong"
-QDRANT_URL = "http://localhost:6333"
-qdrant_client = QdrantClient(url=QDRANT_URL)
-try:
-    qdrant_client.get_collection(COLLECTION_NAME)
-except Exception:
-    print(f"  -> Collection '{COLLECTION_NAME}' chưa tồn tại trên Qdrant. Đang tạo mới...")
-    qdrant_client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE)
-    )
-
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = os.getenv("NEO4J_USER")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 def clean_italic_markers(text: str) -> str:
     return re.sub(r'\*([^*]+)\*', r'\1', text)
@@ -123,6 +102,74 @@ def hierarchical_chunk(json_data: dict) -> list:
         "doc_id": doc_id, "source_url": json_data["source_url"], "title": clean_main_title,
         **json_data.get("metadata", {}),
     }
+
+    meta_dict = json_data.get("metadata", {})
+
+    meta_text = (
+        f"Thông tin chung (Metadata) của văn bản pháp luật:\n"
+        f"- Tên văn bản: {clean_main_title}\n"
+        f"- Loại văn bản: {meta_dict.get('Loại văn bản', 'Không có thông tin')}\n"
+        f"- Nơi ban hành: {meta_dict.get('Nơi ban hành', 'Không có thông tin')}\n"
+        f"- Người ký: {meta_dict.get('Người ký', 'Không có thông tin')}\n"
+        f"- Ngày ban hành: {meta_dict.get('Ngày ban hành', 'Không có thông tin')}\n"
+        f"- Ngày hiệu lực: {meta_dict.get('Ngày hiệu lực', 'Không có thông tin')}\n"
+        f"- Tình trạng: {meta_dict.get('Tình trạng', 'Không có thông tin')}\n"
+        f"- Số công báo: {meta_dict.get('Số công báo', 'Không có thông tin')}\n"
+        f"- Ngày công báo: {meta_dict.get('Ngày công báo', 'Không có thông tin')}\n"
+    )
+
+    chunks.append({
+        **base_meta,
+        "chunk_type": "Document_Meta",
+        "parent_chunk_id": doc_id,
+        "content": meta_text,
+        "content_embed": meta_text,
+        "chunk_id": f"meta_{doc_id}"
+    })
+
+    summary = json_data.get("summary_content", "").strip()
+    if summary:
+        summary_header = f"Tóm tắt nội dung văn bản: {clean_main_title}\n\n"
+        full_summary_text = summary_header + summary
+
+        if count_tokens(full_summary_text) <= MAX_TOKENS:
+            chunks.append({
+                **base_meta,
+                "chunk_type": "Summary",
+                "parent_chunk_id": doc_id,
+                "content": summary,
+                "content_embed": full_summary_text,
+                "chunk_id": f"summary_{doc_id}"
+            })
+        else:
+            summary_parts = re.split(r'\n\n+', summary)
+            buf_raw, p_idx = "", 1
+
+            for p_raw in summary_parts:
+                test_text = summary_header + (f"{buf_raw}\n\n{p_raw}".strip() if buf_raw else p_raw)
+
+                if count_tokens(test_text) > MAX_TOKENS and buf_raw:
+                    chunks.append({
+                        **base_meta,
+                        "chunk_type": "Summary_Split",
+                        "parent_chunk_id": doc_id,
+                        "content": buf_raw,
+                        "content_embed": summary_header + buf_raw,
+                        "chunk_id": f"summary_{doc_id}_part{p_idx}"
+                    })
+                    buf_raw, p_idx = p_raw, p_idx + 1
+                else:
+                    buf_raw = f"{buf_raw}\n\n{p_raw}".strip() if buf_raw else p_raw
+
+            if buf_raw:
+                chunks.append({
+                    **base_meta,
+                    "chunk_type": "Summary_Split",
+                    "parent_chunk_id": doc_id,
+                    "content": buf_raw,
+                    "content_embed": summary_header + buf_raw,
+                    "chunk_id": f"summary_{doc_id}_part{p_idx}"
+                })
 
     main_content = json_data.get("main_content", "")
 
@@ -419,131 +466,7 @@ def hierarchical_chunk(json_data: dict) -> list:
 
     return chunks
 
-def upload_to_databases(valid_chunks: list, doc_meta: dict):
-    filtered_chunks = [
-        chunk for chunk in valid_chunks
-        if chunk.get("chunk_type") in ['Amendment', 'Amendment_Split']
-           or chunk.get("content_embed")
-    ]
-
-    texts_to_encode = [
-        chunk['content'] if chunk.get("chunk_type") in ['Amendment', 'Amendment_Split'] else chunk["content_embed"]
-        for chunk in filtered_chunks
-    ]
-
-    if texts_to_encode:
-        vectors = model.encode(texts_to_encode, batch_size=16, show_progress_bar=True)
-
-        points = []
-        for i, chunk in enumerate(filtered_chunks):
-            chunk.pop("content_embed", None)
-            qdrant_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk['chunk_id']))
-            points.append(models.PointStruct(id=qdrant_uuid, vector=vectors[i].tolist(), payload=chunk))
-
-        qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
-
-    with neo4j_driver.session() as session:
-        meta = doc_meta.get("metadata", {})
-
-        session.run("""
-                        MERGE (d:Document {doc_id: $doc_id})
-                        SET d.title = $title,
-                            d.source_url = $source_url,
-                            d.loai_van_ban = $loai_van_ban,
-                            d.noi_ban_hanh = $noi_ban_hanh,
-                            d.nguoi_ky = $nguoi_ky,
-                            d.ngay_ban_hanh = $ngay_ban_hanh,
-                            d.ngay_hieu_luc = $ngay_hieu_luc,
-                            d.ngay_cong_bao = $ngay_cong_bao,
-                            d.so_cong_bao = $so_cong_bao,
-                            d.tinh_trang = $tinh_trang,
-                            d.summary_content = $summary_content
-                    """,
-                    doc_id=doc_meta.get('doc_id'),
-                    title=doc_meta.get('title'),
-                    source_url=doc_meta.get('source_url'),
-                    loai_van_ban=meta.get('Loại văn bản'),
-                    noi_ban_hanh=meta.get('Nơi ban hành'),
-                    nguoi_ky=meta.get('Người ký'),
-                    ngay_ban_hanh=meta.get('Ngày ban hành'),
-                    ngay_hieu_luc=meta.get('Ngày hiệu lực'),
-                    ngay_cong_bao=meta.get('Ngày công báo'),
-                    so_cong_bao=meta.get('Số công báo'),
-                    tinh_trang=meta.get('Tình trạng'),
-                    summary_content=doc_meta.get('summary_content')
-                    )
-
-        session.run("""
-            MATCH (d:Document {doc_id: $doc_id})
-            MATCH (amend:Chunk)
-            WHERE amend.chunk_type IN ['Amendment', 'Amendment_Split'] 
-              AND amend.amended_link IS NOT NULL 
-              AND split(amend.amended_link, '?')[0] = $source_url
-            MERGE (amend)-[:AMENDS_DOCUMENT]->(d)
-        """, doc_id=doc_meta['doc_id'], source_url=doc_meta['source_url'])
-
-        for chunk in valid_chunks:
-            full_name = chunk['content'].split('\n')[0].strip() if chunk.get('chunk_type') in ['Amendment',
-                                                                                               'Amendment_Split'] else \
-            chunk.get('content_embed', chunk['content']).split('\n')[0].strip()
-
-            session.run("""
-                            MERGE (c:Chunk {chunk_id: $chunk_id})
-                            SET c.content = $content,
-                                c.chunk_type = $chunk_type,
-                                c.doc_id = $doc_id,
-                                c.name = $full_name,
-                                c.parent_chunk_id = $parent_chunk_id,
-                                c.bm_title = $bm_title,
-                                c.amended_link = $amended_link
-                        """,
-                        chunk_id=chunk['chunk_id'], content=chunk['content'], chunk_type=chunk.get('chunk_type'),
-                        doc_id=doc_meta['doc_id'], full_name=full_name, parent_chunk_id=chunk.get('parent_chunk_id'),
-                        bm_title=chunk.get('bm_title'), amended_link=chunk.get('amended_link'))
-
-        for chunk in valid_chunks:
-            chunk_type = chunk.get('chunk_type')
-            chunk_id = chunk['chunk_id']
-            parent_chunk_id = chunk.get('parent_chunk_id')
-
-            if chunk_type in ['Amendment', 'Amendment_Split']:
-                tip_id = chunk.get('tip_id')
-                amended_link = chunk.get('amended_link')
-
-                if tip_id:
-                    target_chunk_ids = [c['chunk_id'] for c in valid_chunks if 'amends' in c and tip_id in c['amends']]
-                    if target_chunk_ids:
-                        session.run("""
-                            UNWIND $target_ids AS target_id
-                            MATCH (target:Chunk {chunk_id: target_id})
-                            MATCH (amend:Chunk {chunk_id: $chunk_id})
-                            MERGE (target)-[:HAS_AMENDMENT]->(amend)
-                        """, target_ids=target_chunk_ids, chunk_id=chunk_id)
-
-                if amended_link:
-                    base_url = amended_link.split('?')[0].split('#')[0]
-                    session.run("""
-                        MATCH (amend:Chunk {chunk_id: $chunk_id})
-                        MATCH (d:Document {source_url: $base_url})
-                        MERGE (amend)-[:AMENDS_DOCUMENT]->(d)
-                    """, chunk_id=chunk_id, base_url=base_url)
-
-                continue
-
-            if parent_chunk_id == doc_meta['doc_id']:
-                session.run("""
-                        MATCH (d:Document {doc_id: $doc_id})
-                        MATCH (c:Chunk {chunk_id: $chunk_id})
-                        MERGE (d)-[:CONTAINS]->(c)
-                    """, doc_id=doc_meta['doc_id'], chunk_id=chunk_id)
-            elif parent_chunk_id:
-                session.run("""
-                        MATCH (p:Chunk {chunk_id: $parent_chunk_id, doc_id: $doc_id})
-                        MATCH (c:Chunk {chunk_id: $chunk_id})
-                        MERGE (p)-[:CONTAINS]->(c)
-                    """, parent_chunk_id=parent_chunk_id, chunk_id=chunk_id, doc_id=doc_meta['doc_id'])
-
-def chunk_file(json_file: Path) -> list:
+def chunk_and_save_file(json_file: Path, output_dir: str) -> str:
     with open(json_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -551,28 +474,33 @@ def chunk_file(json_file: Path) -> list:
     valid_chunks = [c for c in chunk_list]
 
     if valid_chunks:
-        doc_meta = {
-            "doc_id": valid_chunks[0]["doc_id"],
-            "title": data.get("title", ""),
-            "source_url": data.get("source_url", ""),
-            "metadata": data.get("metadata", {}),
-            "summary_content": data.get("summary_content", ""),
-        }
-        upload_to_databases(valid_chunks, doc_meta)
+        doc_id = valid_chunks[0]["doc_id"]
+        output_filename = f"{doc_id}_chunks.json"
+        output_filepath = os.path.join(output_dir, output_filename)
 
-    return valid_chunks
+        with open(output_filepath, "w", encoding="utf-8") as f:
+            json.dump(valid_chunks, f, ensure_ascii=False, indent=4)
+
+        return output_filepath
+    return None
 
 if __name__ == "__main__":
+    OUTPUT_DIR = "data_chunked"
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print(f"Bắt đầu cắt chunk và lưu vào thư mục: {OUTPUT_DIR}")
+
     for root, dirs, files in os.walk("data_json_new"):
         for file in files:
             json_file = Path(os.path.join(root, file))
-            result_chunks = chunk_file(json_file)
-            if len(result_chunks) > 0:
-                print(f"done: {json_file}")
+            saved_path = chunk_and_save_file(json_file, OUTPUT_DIR)
+            if saved_path:
+                print(f"  [+] Đã lưu: {saved_path}")
 
     for root, dirs, files in os.walk("data_json_next"):
         for file in files:
             json_file = Path(os.path.join(root, file))
-            result_chunks = chunk_file(json_file)
-            if len(result_chunks) > 0:
-                print(f"done: {json_file}")
+            saved_path = chunk_and_save_file(json_file, OUTPUT_DIR)
+            if saved_path:
+                print(f"  [+] Đã lưu: {saved_path}")
